@@ -302,6 +302,7 @@ void handleClient(WiFiClient& client) {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("hello world");
   delay(200);
 
   pinMode(LED_PIN, OUTPUT);
