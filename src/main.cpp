@@ -1,341 +1,184 @@
 #include <Arduino.h>
-#include <WiFi.h>
+#include <SPI.h>
+#include <RadioLib.h>
 
-// TCP server
-#define TCP_PORT 5000
-#define LED_PIN 2
+// ---------------------------------------------------------------------------
+// LoRa full-duplex connection test for the Seeed XIAO ESP32-S3 + Wio-SX1262 kit
+//
+// Flash this SAME sketch to BOTH boards. Each board:
+//   * derives a unique 1-byte node id from its chip MAC,
+//   * stays in receive mode and prints every packet it hears,
+//   * periodically transmits a counter message to the other board.
+//
+// Note on "full duplex": the SX1262 has a single transceiver, so it cannot
+// physically transmit and receive at the exact same instant. This sketch is
+// interrupt-driven and spends nearly all of its time in receive mode, only
+// briefly switching to transmit. A small random jitter is added to each send
+// so the two boards do not fall into lockstep and constantly collide.
+// ---------------------------------------------------------------------------
 
-// SPI LoRa pins - currently defined but not used in this TCP echo code
-#define LORA_SPI_SCK   18
-#define LORA_SPI_MOSI  23
-#define LORA_SPI_MISO  19
-#define LORA_SPI_NSS   5
-#define LORA_SPI_RST   14
-#define LORA_SPI_DIO0  27
+// ---- Pin map: FIXED by the Wio-SX1262 board-to-board (B2B) connector -------
+// These are raw ESP32-S3 GPIO numbers and should NOT be changed for this kit.
+#define LORA_NSS   41   // SPI chip select
+#define LORA_DIO1  39   // IRQ line
+#define LORA_RST   42   // reset
+#define LORA_BUSY  40   // busy
+#define LORA_SCK    7   // SPI clock
+#define LORA_MISO   8   // SPI MISO
+#define LORA_MOSI   9   // SPI MOSI
 
-// UART LoRa pins - currently defined but not used in this TCP echo code
-#define LORA_UART_RX 33  // ESP32 receives from LoRa TXD
-#define LORA_UART_TX 32  // ESP32 transmits to LoRa RXD
+// ---- Radio configuration ---------------------------------------------------
+// IMPORTANT: both boards MUST use the same frequency, and it must be legal in
+// your region. The Wio-SX1262 supports 862-930 MHz:
+//   868.0 -> EU868
+//   915.0 -> US915 / AU915
+#define LORA_FREQUENCY 868.0
 
-const char* ssid = "dora";
-const char* password = "dora1234";
+// The Wio-SX1262 uses a 1.8 V TCXO powered from the radio's DIO3 pin. Passing
+// the correct voltage here is required for the radio to calibrate on boot.
+#define LORA_TCXO_VOLTAGE 1.8
 
-WiFiServer tcpServer(TCP_PORT);
+// How often (ms) each board sends a heartbeat message.
+static const unsigned long SEND_INTERVAL_MS = 3000;
 
-static const unsigned long LINE_TIMEOUT_MS = 10000;
-static const unsigned long PAYLOAD_TIMEOUT_MS = 15000;
-static const size_t MAX_HEADER_LENGTH = 256;
-static const size_t BUFFER_SIZE = 1024;
+// SX1262 radio instance: Module(cs/NSS, irq/DIO1, reset, busy).
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
-// Important:
-// The ESP32 must keep the received payload in RAM so it can send it back.
-// Keep this value reasonable. Large files may fail due to RAM limits.
-static const size_t MAX_ECHO_PAYLOAD_SIZE = 200 * 1024; // 200 KB
+uint8_t localAddress = 0x00;   // this board's id (set from MAC in setup)
+uint32_t txCounter = 0;        // number of messages this board has sent
+uint32_t rxCounter = 0;        // number of messages this board has received
+unsigned long lastSendTime = 0;
+unsigned long sendInterval = SEND_INTERVAL_MS;
 
-void blinkLed(int count, int delayMs = 80) {
-  for (int i = 0; i < count; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(delayMs);
-    digitalWrite(LED_PIN, LOW);
-    delay(delayMs);
+// Set by the DIO1 interrupt when the current TX or RX operation completes.
+volatile bool operationDone = false;
+// True while a transmit is in flight, so we know how to interpret the IRQ.
+bool transmitting = false;
+
+// Runs in interrupt context, so keep it tiny: just raise a flag.
+IRAM_ATTR void onDio1(void) {
+  operationDone = true;
+}
+
+// Halt with a repeating message so a wiring/config problem is obvious.
+void halt(const char* reason, int code) {
+  while (true) {
+    Serial.printf("HALTED: %s (code %d)\n", reason, code);
+    delay(2000);
   }
 }
 
-bool readLineFromClient(WiFiClient& client, String& line, unsigned long timeoutMs) {
-  line = "";
-  unsigned long start = millis();
+void startTx() {
+  String message = "hello from 0x" + String(localAddress, HEX) +
+                   " count=" + String(txCounter);
 
-  while (client.connected() && millis() - start < timeoutMs) {
-    while (client.available()) {
-      char c = (char)client.read();
-
-      if (c == '\n') {
-        line.trim();
-        return true;
-      }
-
-      if (c != '\r') {
-        line += c;
-      }
-
-      if (line.length() > MAX_HEADER_LENGTH) {
-        Serial.println("Header too long.");
-        return false;
-      }
-    }
-
-    delay(1);
+  int state = radio.startTransmit(message);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("[TX #%lu] \"%s\"\n", (unsigned long)txCounter, message.c_str());
+    transmitting = true;
+    txCounter++;
+  } else {
+    Serial.printf("[TX] startTransmit failed, code %d\n", state);
   }
-
-  Serial.println("Timed out while reading line.");
-  return false;
 }
 
-bool parseHeader(const String& header, String& type, String& filename, size_t& size) {
-  int firstColon = header.indexOf(':');
-  int secondColon = header.indexOf(':', firstColon + 1);
+void handleReceivedPacket() {
+  String incoming;
+  int state = radio.readData(incoming);
 
-  if (firstColon <= 0 || secondColon <= firstColon + 1) {
-    return false;
+  if (state == RADIOLIB_ERR_NONE) {
+    rxCounter++;
+    Serial.printf(
+      "[RX #%lu] \"%s\"  (RSSI %.1f dBm, SNR %.1f dB)\n",
+      (unsigned long)rxCounter,
+      incoming.c_str(),
+      radio.getRSSI(),
+      radio.getSNR()
+    );
+  } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+    Serial.println("[RX] packet received but CRC failed.");
+  } else {
+    Serial.printf("[RX] readData failed, code %d\n", state);
   }
-
-  type = header.substring(0, firstColon);
-  filename = header.substring(firstColon + 1, secondColon);
-  String sizeString = header.substring(secondColon + 1);
-
-  if (type != "TEXT" && type != "FILE") {
-    return false;
-  }
-
-  if (filename.length() == 0 || sizeString.length() == 0) {
-    return false;
-  }
-
-  for (size_t i = 0; i < sizeString.length(); i++) {
-    if (!isDigit(sizeString[i])) {
-      return false;
-    }
-  }
-
-  size = (size_t)sizeString.toInt();
-  return true;
-}
-
-bool readPayloadBytes(
-  WiFiClient& client,
-  uint8_t* payload,
-  size_t size,
-  const String& type,
-  const String& filename
-) {
-  size_t totalRead = 0;
-  unsigned long lastDataTime = millis();
-
-  Serial.printf(
-    "Receiving %s '%s' (%u bytes)\n",
-    type.c_str(),
-    filename.c_str(),
-    (unsigned int)size
-  );
-
-  if (type == "TEXT") {
-    Serial.print("Text content: ");
-  }
-
-  while (client.connected() && totalRead < size) {
-    int availableBytes = client.available();
-
-    if (availableBytes > 0) {
-      size_t remaining = size - totalRead;
-      size_t toRead = min((size_t)availableBytes, remaining);
-
-      int bytesRead = client.read(payload + totalRead, toRead);
-
-      if (bytesRead > 0) {
-        if (type == "TEXT") {
-          for (int i = 0; i < bytesRead; i++) {
-            Serial.write(payload[totalRead + i]);
-          }
-        }
-
-        totalRead += bytesRead;
-        lastDataTime = millis();
-      }
-    } else {
-      if (millis() - lastDataTime > PAYLOAD_TIMEOUT_MS) {
-        Serial.println();
-        Serial.println("Timed out while reading payload.");
-        return false;
-      }
-
-      delay(1);
-    }
-  }
-
-  if (type == "TEXT") {
-    Serial.println();
-  }
-
-  Serial.printf(
-    "Finished receiving %u / %u bytes\n",
-    (unsigned int)totalRead,
-    (unsigned int)size
-  );
-
-  return totalRead == size;
-}
-
-bool sendEchoPacket(
-  WiFiClient& client,
-  const String& type,
-  const String& filename,
-  const uint8_t* payload,
-  size_t size
-) {
-  String echoHeader = "ECHO:" + type + ":" + filename + ":" + String(size) + "\n";
-
-  size_t headerWritten = client.print(echoHeader);
-  if (headerWritten == 0) {
-    Serial.println("Failed to send echo header.");
-    return false;
-  }
-
-  size_t totalSent = 0;
-
-  while (client.connected() && totalSent < size) {
-    size_t remaining = size - totalSent;
-    size_t chunkSize = min(remaining, (size_t)BUFFER_SIZE);
-
-    size_t sent = client.write(payload + totalSent, chunkSize);
-
-    if (sent == 0) {
-      Serial.println("Failed while sending echo payload.");
-      return false;
-    }
-
-    totalSent += sent;
-    delay(1);
-  }
-
-  client.flush();
-
-  Serial.printf(
-    "Echo sent: %s '%s' (%u bytes)\n",
-    type.c_str(),
-    filename.c_str(),
-    (unsigned int)size
-  );
-
-  return totalSent == size;
-}
-
-void handleClient(WiFiClient& client) {
-  Serial.println("TCP client connected.");
-
-  client.setNoDelay(true);
-
-  String line;
-
-  while (client.connected()) {
-    bool gotLine = readLineFromClient(client, line, LINE_TIMEOUT_MS);
-
-    if (!gotLine) {
-      break;
-    }
-
-    if (line.length() == 0) {
-      continue;
-    }
-
-    Serial.print("Header/message received: ");
-    Serial.println(line);
-
-    if (line == "HELLO") {
-      client.println("ESP32_DORA_OK");
-      Serial.println("Handshake answered.");
-      continue;
-    }
-
-    String type;
-    String filename;
-    size_t payloadSize = 0;
-
-    if (!parseHeader(line, type, filename, payloadSize)) {
-      Serial.println("Invalid header.");
-      client.println("ERROR:BAD_HEADER");
-      continue;
-    }
-
-    if (payloadSize > MAX_ECHO_PAYLOAD_SIZE) {
-      Serial.println("Payload too large for echo.");
-      client.println("ERROR:PAYLOAD_TOO_LARGE");
-      continue;
-    }
-
-    uint8_t* payload = nullptr;
-
-    if (payloadSize > 0) {
-      payload = (uint8_t*)malloc(payloadSize);
-
-      if (payload == nullptr) {
-        Serial.println("Failed to allocate payload buffer.");
-        client.println("ERROR:NO_MEMORY");
-        continue;
-      }
-    }
-
-    bool ok = readPayloadBytes(client, payload, payloadSize, type, filename);
-
-    if (!ok) {
-      client.println("ERROR:READ_FAILED");
-
-      if (payload != nullptr) {
-        free(payload);
-      }
-
-      break;
-    }
-
-    client.println("OK");
-    blinkLed(1);
-
-    bool echoOk = sendEchoPacket(client, type, filename, payload, payloadSize);
-
-    if (!echoOk) {
-      Serial.println("Echo failed.");
-      if (payload != nullptr) {
-        free(payload);
-      }
-      break;
-    }
-
-    if (payload != nullptr) {
-      free(payload);
-    }
-
-    delay(1);
-  }
-
-  client.stop();
-  Serial.println("TCP client disconnected.");
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("hello world");
-  delay(200);
-
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
+  delay(500);
   Serial.println();
-  Serial.printf("Starting WiFi Access Point '%s'...\n", ssid);
+  Serial.println("=== XIAO ESP32-S3 + Wio-SX1262 LoRa full-duplex test ===");
 
-  WiFi.mode(WIFI_AP);
-
-  bool result = WiFi.softAP(ssid, password);
-
-  if (result) {
-    Serial.println("Access Point started successfully.");
-    Serial.print("AP IP address: ");
-    Serial.println(WiFi.softAPIP());
-
-    tcpServer.begin();
-    tcpServer.setNoDelay(true);
-
-    Serial.printf("TCP server listening on port %d\n", TCP_PORT);
-    blinkLed(3);
-  } else {
-    Serial.println("Failed to start Access Point.");
+  // Unique id from the low byte of the chip MAC, so the same binary running on
+  // both boards yields two different ids without editing the code per board.
+  uint64_t mac = ESP.getEfuseMac();
+  localAddress = (uint8_t)(mac & 0xFF);
+  if (localAddress == 0x00 || localAddress == 0xFF) {
+    localAddress = 0x01;
   }
+  Serial.printf("This node id: 0x%02X\n", localAddress);
+
+  // Bring up SPI on the XIAO ESP32-S3 pins the Wio-SX1262 is wired to.
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  Serial.printf("Starting SX1262 at %.1f MHz...\n", (double)LORA_FREQUENCY);
+  // begin(freq, bw, sf, cr, syncWord, power, preamble, tcxoVoltage, useLDO)
+  int state = radio.begin(
+    LORA_FREQUENCY,
+    125.0,   // bandwidth (kHz)
+    9,       // spreading factor
+    7,       // coding rate (4/7)
+    RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
+    10,      // TX power (dBm)
+    8,       // preamble length
+    LORA_TCXO_VOLTAGE,
+    false    // use DC-DC + TCXO, not LDO
+  );
+  if (state != RADIOLIB_ERR_NONE) {
+    halt("SX1262 init failed - check B2B connector seating and frequency", state);
+  }
+
+  // The Wio-SX1262 routes DIO2 to its internal RF switch; RadioLib toggles it
+  // automatically between RX and TX when this is enabled.
+  state = radio.setDio2AsRfSwitch(true);
+  if (state != RADIOLIB_ERR_NONE) {
+    halt("setDio2AsRfSwitch failed", state);
+  }
+
+  // Route the DIO1 interrupt to our flag setter, then start listening.
+  radio.setDio1Action(onDio1);
+
+  state = radio.startReceive();
+  if (state != RADIOLIB_ERR_NONE) {
+    halt("startReceive failed", state);
+  }
+
+  Serial.println("SX1262 init OK. Listening and transmitting...");
+  randomSeed((uint32_t)mac);
+  lastSendTime = millis();
 }
 
 void loop() {
-  WiFiClient client = tcpServer.available();
+  // ---- Handle a completed radio operation signalled by the DIO1 IRQ ----
+  if (operationDone) {
+    operationDone = false;
 
-  if (client) {
-    handleClient(client);
+    if (transmitting) {
+      // Transmit finished: release the TX resources and return to listening.
+      radio.finishTransmit();
+      transmitting = false;
+      radio.startReceive();
+    } else {
+      // A packet arrived while we were listening.
+      handleReceivedPacket();
+      radio.startReceive();
+    }
   }
 
-  delay(1);
+  // ---- Periodically transmit a heartbeat (only when not already sending) ----
+  if (!transmitting && millis() - lastSendTime >= sendInterval) {
+    startTx();
+    lastSendTime = millis();
+    // 0..800 ms jitter so the two boards don't stay perfectly synchronized.
+    sendInterval = SEND_INTERVAL_MS + (unsigned long)random(0, 800);
+  }
 }
