@@ -51,8 +51,11 @@ static const size_t   LORA_HDR = 5;
 static const size_t   LORA_CHUNK = 200;
 // Largest message we will bridge in either direction.
 static const size_t   MAX_BRIDGE_PAYLOAD = 20480;
-// Upper bound on fragments per message (metadata + data chunks), with margin.
-static const uint16_t MAX_FRAGS = 20;
+// Enough fragments to cover MAX_BRIDGE_PAYLOAD (1 metadata frag + data chunks),
+// derived so it can never fall behind MAX_BRIDGE_PAYLOAD. NOTE: fragIndex and
+// fragCount are single bytes in the LoRa header, so this must stay <= 255, i.e.
+// MAX_BRIDGE_PAYLOAD up to ~50 KB at LORA_CHUNK = 200.
+static const uint16_t MAX_FRAGS = (MAX_BRIDGE_PAYLOAD + LORA_CHUNK - 1) / LORA_CHUNK + 2;
 // dst value that every node accepts.
 static const uint8_t  BROADCAST_ADDR = 0xFF;
 // Drop a half-reassembled inbound message if it stalls this long.
@@ -277,6 +280,11 @@ void feedReassembler(
   size_t dataLen
 ) {
   if (fragCount == 0 || fragCount > MAX_FRAGS) {
+    Serial.printf(
+      "[RX] fragCount %u exceeds MAX_FRAGS %u; message too large, dropping\n",
+      fragCount,
+      (unsigned int)MAX_FRAGS
+    );
     return;
   }
   if (fragIndex >= fragCount) {
