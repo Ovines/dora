@@ -39,7 +39,7 @@
 #define LORA_TCXO_VOLTAGE 1.8
 
 // How often (ms) each board sends a heartbeat message.
-static const unsigned long SEND_INTERVAL_MS = 3000;
+static const unsigned long SEND_INTERVAL_MS = 15000;
 
 // SX1262 radio instance: Module(cs/NSS, irq/DIO1, reset, busy).
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
