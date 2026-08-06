@@ -124,12 +124,12 @@ void setup() {
   // begin(freq, bw, sf, cr, syncWord, power, preamble, tcxoVoltage, useLDO)
   int state = radio.begin(
     LORA_FREQUENCY,
-    125.0,   // bandwidth (kHz)
-    9,       // spreading factor
-    7,       // coding rate (4/7)
+    62.5,   // bandwidth (kHz)
+    12,       // spreading factor
+    8,       // coding rate (4/7)
     RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
-    10,      // TX power (dBm)
-    8,       // preamble length
+    13,      // TX power (dBm)
+    12,       // preamble length
     LORA_TCXO_VOLTAGE,
     false    // use DC-DC + TCXO, not LDO
   );
