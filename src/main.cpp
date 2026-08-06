@@ -45,9 +45,9 @@ static const char* AP_PASS = "dora1234";
 static const uint16_t TCP_PORT = 5000;
 
 // ---- Bridge sizing ---------------------------------------------------------
-// LoRa packet layout: [dst][src][msgId][fragIndex][fragCount] + data.
-static const size_t   LORA_HDR = 5;
-// Data bytes per LoRa packet. 5 + 200 = 205 <= SX1262 max (255).
+// LoRa packet layout: [dst][src][kind][msgId][fragIndex][fragCount] + payload.
+static const size_t   LORA_HDR = 6;
+// Data bytes per LoRa packet. 6 + 200 = 206 <= SX1262 max (255).
 static const size_t   LORA_CHUNK = 200;
 // Largest message we will bridge in either direction.
 static const size_t   MAX_BRIDGE_PAYLOAD = 20480;
@@ -58,10 +58,25 @@ static const size_t   MAX_BRIDGE_PAYLOAD = 20480;
 static const uint16_t MAX_FRAGS = (MAX_BRIDGE_PAYLOAD + LORA_CHUNK - 1) / LORA_CHUNK + 2;
 // dst value that every node accepts.
 static const uint8_t  BROADCAST_ADDR = 0xFF;
-// Drop a half-reassembled inbound message if it stalls this long.
-static const unsigned long REASSEMBLY_TIMEOUT_MS = 40000;
 // Cap on a single TCP header line, matching the master protocol.
 static const size_t   MAX_HEADER_LENGTH = 256;
+
+// ---- Reliability (NACK-based ARQ) ------------------------------------------
+// Packet kinds carried in the header 'kind' byte.
+enum LoraKind {
+  KIND_DATA = 0,   // fragIndex/fragCount valid; payload = metadata (frag 0) or chunk
+  KIND_END  = 1,   // sender -> receiver: all fragments for this pass were sent
+  KIND_NACK = 2,   // receiver -> sender: payload = missing fragment indices (1 byte each)
+  KIND_DONE = 3    // receiver -> sender: full message received
+};
+// After sending END, how long the sender waits for a NACK/DONE before it
+// re-prompts by resending END.
+static const unsigned long AWAIT_TIMEOUT_MS = 4000;
+// Resend passes (NACK rounds + END re-prompts) before the sender gives up.
+static const int           MAX_TX_ROUNDS = 12;
+// Drop a half-reassembled inbound message if it stalls this long. Must comfortably
+// exceed MAX_TX_ROUNDS * AWAIT_TIMEOUT_MS so a slow recovery is not dropped early.
+static const unsigned long REASSEMBLY_TIMEOUT_MS = 90000;
 
 // SX1262 radio instance: Module(cs/NSS, irq/DIO1, reset, busy).
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
@@ -76,15 +91,24 @@ volatile bool operationDone = false;
 // True while a LoRa transmit is in flight, so we know how to read the IRQ.
 bool transmitting = false;
 
+// What the current in-flight transmit is, so the completion IRQ knows what to do
+// next (keep sending data, wait for a reply, or just resume listening).
+enum RadioTx { RTX_NONE, RTX_DATA, RTX_END, RTX_NACK, RTX_DONE };
+RadioTx currentTx = RTX_NONE;
+
 // ---- Outbound (WiFi client -> LoRa) message state --------------------------
+enum TxPhase { TX_IDLE, TX_SENDING, TX_AWAIT };
 uint8_t  txAssembly[MAX_BRIDGE_PAYLOAD];  // payload staged from the TCP client
 bool     txActive = false;                // a message is being sent over LoRa
+TxPhase  txPhase = TX_IDLE;
 uint8_t  txMsgId = 0;                      // rolling id stamped on each message
 String   txType;
 String   txFilename;
 size_t   txPayloadSize = 0;
 uint16_t txFragCount = 0;                  // metadata frag + data frags
-uint16_t txNextFrag = 0;                   // index of the fragment to send next
+bool     txToSend[MAX_FRAGS];              // fragments still to send this pass
+int      txRound = 0;                      // resend pass counter (1-based)
+unsigned long txAwaitStart = 0;            // when we began waiting after END
 uint32_t bridgedTx = 0;
 
 // ---- Inbound (LoRa -> WiFi client) reassembly state ------------------------
@@ -101,6 +125,18 @@ String   rxFilename;
 size_t   rxSize = 0;
 unsigned long rxLastMillis = 0;
 uint32_t bridgedRx = 0;
+
+// Remember the most recently completed inbound message so a late END (whose DONE
+// was lost) can be re-acknowledged without re-delivering to the client.
+bool     lastCompletedValid = false;
+uint8_t  lastCompletedSrc = 0;
+uint8_t  lastCompletedMsgId = 0;
+
+// Pending receiver control response, transmitted from the scheduler when the
+// radio is idle. NACK-vs-DONE and the missing list are (re)computed at send time.
+bool     pendingRespond = false;
+uint8_t  pendingDst = 0;
+uint8_t  pendingMsgId = 0;
 
 // ---- Non-blocking TCP client parser state ----------------------------------
 enum WifiState { WIFI_HEADER, WIFI_PAYLOAD, WIFI_SKIP };
@@ -158,20 +194,32 @@ bool parseHeader(const String& header, String& type, String& filename, size_t& s
 }
 
 // ---------------------------------------------------------------------------
-// Outbound path: WiFi client -> LoRa
+// Outbound path: WiFi client -> LoRa (sender ARQ)
 // ---------------------------------------------------------------------------
 
-// Build and start transmitting the fragment currently indexed by txNextFrag.
-void sendNextFragment() {
+// Abort the current outbound message and tell the WiFi client why.
+void failTx(const char* reason) {
+  txActive = false;
+  txPhase = TX_IDLE;
+  if (currentClient && currentClient.connected()) {
+    currentClient.print("ERROR:");
+    currentClient.println(reason);
+  }
+  radio.startReceive();
+}
+
+// Transmit one data fragment: metadata line for index 0, payload chunk otherwise.
+void sendData(uint16_t index) {
   uint8_t buf[LORA_HDR + LORA_CHUNK];
   buf[0] = BROADCAST_ADDR;
   buf[1] = localAddress;
-  buf[2] = txMsgId;
-  buf[3] = (uint8_t)txNextFrag;
-  buf[4] = (uint8_t)txFragCount;
+  buf[2] = KIND_DATA;
+  buf[3] = txMsgId;
+  buf[4] = (uint8_t)index;
+  buf[5] = (uint8_t)txFragCount;
   size_t len = LORA_HDR;
 
-  if (txNextFrag == 0) {
+  if (index == 0) {
     // Fragment 0 carries the metadata line the far side needs to re-frame.
     String meta = txType + ":" + txFilename + ":" + String((unsigned int)txPayloadSize);
     size_t n = meta.length();
@@ -181,7 +229,7 @@ void sendNextFragment() {
     memcpy(buf + LORA_HDR, meta.c_str(), n);
     len += n;
   } else {
-    size_t offset = (size_t)(txNextFrag - 1) * LORA_CHUNK;
+    size_t offset = (size_t)(index - 1) * LORA_CHUNK;
     size_t chunk = txPayloadSize - offset;
     if (chunk > LORA_CHUNK) {
       chunk = LORA_CHUNK;
@@ -193,21 +241,49 @@ void sendNextFragment() {
   int state = radio.startTransmit(buf, len);
   if (state == RADIOLIB_ERR_NONE) {
     transmitting = true;
+    currentTx = RTX_DATA;
     Serial.printf(
-      "[TX] msg %u frag %u/%u (%u bytes)\n",
+      "[TX] msg %u DATA frag %u/%u (%u bytes)\n",
       txMsgId,
-      (unsigned int)txNextFrag,
+      (unsigned int)index,
       (unsigned int)(txFragCount - 1),
       (unsigned int)len
     );
   } else {
-    Serial.printf("[TX] startTransmit failed, code %d\n", state);
-    txActive = false;
-    if (currentClient && currentClient.connected()) {
-      currentClient.println("ERROR:TX_FAILED");
-    }
-    radio.startReceive();
+    Serial.printf("[TX] startTransmit(DATA) failed, code %d\n", state);
+    failTx("TX_FAILED");
   }
+}
+
+// Transmit an END marker: "all fragments for this pass have been sent".
+void sendEnd() {
+  uint8_t buf[LORA_HDR];
+  buf[0] = BROADCAST_ADDR;
+  buf[1] = localAddress;
+  buf[2] = KIND_END;
+  buf[3] = txMsgId;
+  buf[4] = 0;
+  buf[5] = (uint8_t)txFragCount;
+
+  int state = radio.startTransmit(buf, LORA_HDR);
+  if (state == RADIOLIB_ERR_NONE) {
+    transmitting = true;
+    currentTx = RTX_END;
+    Serial.printf("[TX] msg %u END (round %d)\n", txMsgId, txRound);
+  } else {
+    Serial.printf("[TX] startTransmit(END) failed, code %d\n", state);
+    failTx("TX_FAILED");
+  }
+}
+
+// Index of the lowest fragment still needing transmission this pass, or -1.
+int nextToSend() {
+  for (uint16_t i = 0; i < txFragCount; i++) {
+    if (txToSend[i]) {
+      return (int)i;
+    }
+  }
+  return -1;
 }
 
 // Queue a fully-received TCP message (payload already staged in txAssembly).
@@ -219,7 +295,11 @@ void startBridgeTx(const String& type, const String& filename, size_t size) {
 
   uint16_t dataFrags = (uint16_t)((size + LORA_CHUNK - 1) / LORA_CHUNK); // 0 when size==0
   txFragCount = 1 + dataFrags;
-  txNextFrag = 0;
+  for (uint16_t i = 0; i < MAX_FRAGS; i++) {
+    txToSend[i] = (i < txFragCount);
+  }
+  txPhase = TX_SENDING;
+  txRound = 1;
   txActive = true;
   bridgedTx++;
 
@@ -231,6 +311,44 @@ void startBridgeTx(const String& type, const String& filename, size_t size) {
     (unsigned int)size,
     (unsigned int)txFragCount
   );
+}
+
+// A NACK arrived for our in-flight message: re-mark the missing fragments and
+// start another send pass, or give up once we exceed MAX_TX_ROUNDS.
+void onNack(uint8_t msgId, const uint8_t* missing, size_t count) {
+  if (!txActive || msgId != txMsgId) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    uint8_t idx = missing[i];
+    if (idx < txFragCount) {
+      txToSend[idx] = true;
+    }
+  }
+  txRound++;
+  Serial.printf(
+    "[ARQ] NACK for msg %u: %u frag(s) to resend (round %d)\n",
+    msgId, (unsigned int)count, txRound);
+
+  if (txRound > MAX_TX_ROUNDS) {
+    Serial.printf("[ARQ] msg %u exceeded MAX_TX_ROUNDS; giving up\n", msgId);
+    failTx("LORA_INCOMPLETE");
+  } else {
+    txPhase = TX_SENDING;
+  }
+}
+
+// A DONE arrived for our in-flight message: report success to the WiFi client.
+void onDone(uint8_t msgId) {
+  if (!txActive || msgId != txMsgId) {
+    return;
+  }
+  Serial.printf("[ARQ] DONE for msg %u; delivery confirmed\n", msgId);
+  txActive = false;
+  txPhase = TX_IDLE;
+  if (currentClient && currentClient.connected()) {
+    currentClient.println("OK");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,11 +459,110 @@ void feedReassembler(
   if (rxMetaGot && rxReceivedCount == rxFragCount) {
     bridgedRx++;
     deliverToClient();
+    // Remember this message and queue a DONE ack back to the sender. The sender
+    // keeps re-sending END until it hears DONE, so a lost DONE is re-requested.
+    lastCompletedValid = true;
+    lastCompletedSrc = rxSrc;
+    lastCompletedMsgId = rxMsgId;
+    pendingRespond = true;
+    pendingDst = rxSrc;
+    pendingMsgId = rxMsgId;
     resetRx();
   }
 }
 
-// Read the packet the radio just latched and hand it to the reassembler.
+// Queue a control reply (NACK or DONE) for later transmission by the scheduler.
+void queueRespond(uint8_t dst, uint8_t msgId) {
+  pendingRespond = true;
+  pendingDst = dst;
+  pendingMsgId = msgId;
+}
+
+// Sender says "that's the whole pass". Reply DONE if we already have everything
+// (or already completed this message), otherwise NACK the fragments we lack.
+void onEnd(uint8_t src, uint8_t msgId, uint8_t fragCount) {
+  // Already delivered this exact message: re-acknowledge (handles a lost DONE).
+  bool activeThis = rxActive && rxSrc == src && rxMsgId == msgId;
+  if (!activeThis && lastCompletedValid && src == lastCompletedSrc && msgId == lastCompletedMsgId) {
+    queueRespond(src, msgId);   // sendPendingControl will emit DONE
+    return;
+  }
+
+  // Seed a reassembly slot from END if no DATA fragment has arrived yet.
+  if (!activeThis) {
+    if (fragCount == 0 || fragCount > MAX_FRAGS) {
+      return;
+    }
+    resetRx();
+    rxActive = true;
+    rxSrc = src;
+    rxMsgId = msgId;
+    rxFragCount = fragCount;
+  }
+  rxLastMillis = millis();
+  queueRespond(src, msgId);   // sendPendingControl computes NACK (missing) or DONE
+}
+
+// Transmit the queued receiver control reply. NACK-vs-DONE and the missing list
+// are recomputed here so they are never stale by the time the radio is free.
+void sendPendingControl() {
+  bool sendDone = false;
+  uint8_t missing[MAX_FRAGS];
+  size_t missingCount = 0;
+
+  bool activeThis = rxActive && rxSrc == pendingDst && rxMsgId == pendingMsgId;
+  if (activeThis) {
+    for (uint16_t i = 0; i < rxFragCount; i++) {
+      if (!rxFragGot[i]) {
+        if (missingCount < sizeof(missing)) {
+          missing[missingCount++] = (uint8_t)i;
+        }
+      }
+    }
+    if (missingCount == 0) {
+      sendDone = true;  // became complete meanwhile
+    }
+  } else if (lastCompletedValid && pendingDst == lastCompletedSrc &&
+             pendingMsgId == lastCompletedMsgId) {
+    sendDone = true;
+  } else {
+    pendingRespond = false;  // nothing to say about this message anymore
+    return;
+  }
+
+  uint8_t buf[LORA_HDR + MAX_FRAGS];
+  buf[0] = pendingDst;
+  buf[1] = localAddress;
+  buf[2] = sendDone ? (uint8_t)KIND_DONE : (uint8_t)KIND_NACK;
+  buf[3] = pendingMsgId;
+  buf[4] = 0;
+  buf[5] = (uint8_t)(activeThis ? rxFragCount : 0);
+  size_t len = LORA_HDR;
+  if (!sendDone) {
+    memcpy(buf + LORA_HDR, missing, missingCount);
+    len += missingCount;
+  }
+
+  int state = radio.startTransmit(buf, len);
+  if (state == RADIOLIB_ERR_NONE) {
+    transmitting = true;
+    currentTx = sendDone ? RTX_DONE : RTX_NACK;
+    pendingRespond = false;
+    if (sendDone) {
+      Serial.printf("[TX] msg %u DONE -> 0x%02X\n", pendingMsgId, pendingDst);
+    } else {
+      Serial.printf(
+        "[TX] msg %u NACK %u missing -> 0x%02X\n",
+        pendingMsgId, (unsigned int)missingCount, pendingDst);
+    }
+  } else {
+    // Leave pendingRespond set so we retry on the next idle pass.
+    Serial.printf("[TX] startTransmit(control) failed, code %d\n", state);
+    radio.startReceive();
+  }
+}
+
+// Read the packet the radio just latched, parse the header, and dispatch by kind.
 void handleReceivedPacket() {
   uint8_t buf[LORA_HDR + LORA_CHUNK];
   size_t len = radio.getPacketLength();
@@ -369,25 +586,47 @@ void handleReceivedPacket() {
 
   uint8_t dst = buf[0];
   uint8_t src = buf[1];
-  uint8_t msgId = buf[2];
-  uint8_t fragIndex = buf[3];
-  uint8_t fragCount = buf[4];
+  uint8_t kind = buf[2];
+  uint8_t msgId = buf[3];
+  uint8_t fragIndex = buf[4];
+  uint8_t fragCount = buf[5];
 
   if (dst != localAddress && dst != BROADCAST_ADDR) {
     return;  // not addressed to us
   }
+  if (src == localAddress) {
+    return;  // ignore anything that looks like our own transmission
+  }
 
-  Serial.printf(
-    "[RX] from 0x%02X msg %u frag %u/%u (RSSI %.1f dBm, SNR %.1f dB)\n",
-    src,
-    msgId,
-    fragIndex,
-    fragCount ? (fragCount - 1) : 0,
-    radio.getRSSI(),
-    radio.getSNR()
-  );
+  const uint8_t* payload = buf + LORA_HDR;
+  size_t payloadLen = len - LORA_HDR;
 
-  feedReassembler(src, msgId, fragIndex, fragCount, buf + LORA_HDR, len - LORA_HDR);
+  switch (kind) {
+    case KIND_DATA:
+      Serial.printf(
+        "[RX] DATA from 0x%02X msg %u frag %u/%u (RSSI %.1f dBm, SNR %.1f dB)\n",
+        src, msgId, fragIndex, fragCount ? (fragCount - 1) : 0,
+        radio.getRSSI(), radio.getSNR());
+      feedReassembler(src, msgId, fragIndex, fragCount, payload, payloadLen);
+      break;
+    case KIND_END:
+      Serial.printf("[RX] END from 0x%02X msg %u\n", src, msgId);
+      onEnd(src, msgId, fragCount);
+      break;
+    case KIND_NACK:
+      Serial.printf(
+        "[RX] NACK from 0x%02X msg %u (%u missing)\n",
+        src, msgId, (unsigned int)payloadLen);
+      onNack(msgId, payload, payloadLen);
+      break;
+    case KIND_DONE:
+      Serial.printf("[RX] DONE from 0x%02X msg %u\n", src, msgId);
+      onDone(msgId);
+      break;
+    default:
+      Serial.printf("[RX] unknown kind %u from 0x%02X; ignored\n", kind, src);
+      break;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +834,51 @@ void setup() {
   Serial.println("Bridge ready. Listening on LoRa and WiFi...");
 }
 
+// Decide what to do once the radio finishes the transmit indicated by currentTx.
+void onTransmitComplete() {
+  switch (currentTx) {
+    case RTX_DATA:
+      // More of this pass may remain; the scheduler sends the next fragment or
+      // the END marker without dropping back to receive between fragments.
+      break;
+    case RTX_END:
+      // Whole pass announced: wait for the receiver's NACK/DONE.
+      txPhase = TX_AWAIT;
+      txAwaitStart = millis();
+      radio.startReceive();
+      break;
+    case RTX_NACK:
+    case RTX_DONE:
+    default:
+      radio.startReceive();
+      break;
+  }
+  currentTx = RTX_NONE;
+}
+
+// Drive the radio when it is idle: push the sender's current pass first, then
+// flush any pending receiver control reply.
+void scheduleRadio() {
+  if (transmitting) {
+    return;
+  }
+
+  if (txActive && txPhase == TX_SENDING) {
+    int idx = nextToSend();
+    if (idx >= 0) {
+      txToSend[idx] = false;
+      sendData((uint16_t)idx);
+    } else {
+      sendEnd();
+    }
+    return;
+  }
+
+  if (!txActive && pendingRespond) {
+    sendPendingControl();
+  }
+}
+
 void loop() {
   // ---- Handle a completed radio operation signalled by the DIO1 IRQ ----
   if (operationDone) {
@@ -603,29 +887,32 @@ void loop() {
     if (transmitting) {
       radio.finishTransmit();
       transmitting = false;
-      txNextFrag++;
-
-      if (txNextFrag >= txFragCount) {
-        // Whole message sent: ack the client and return to listening.
-        txActive = false;
-        if (currentClient && currentClient.connected()) {
-          currentClient.println("OK");
-        }
-        Serial.printf("[BRIDGE] LoRa TX complete (msg %u); client ACKed.\n", txMsgId);
-        radio.startReceive();
-      }
-      // Otherwise leave txActive set; the TX driver below sends the next frag
-      // as a tight burst without dropping back to receive between fragments.
+      onTransmitComplete();
     } else {
       handleReceivedPacket();
       radio.startReceive();
     }
   }
 
-  // ---- TX driver: send the next/first fragment when the radio is idle ----
-  if (txActive && !transmitting) {
-    sendNextFragment();
+  // ---- Sender await: re-prompt with END on timeout; give up after the cap ----
+  if (txActive && txPhase == TX_AWAIT && !transmitting) {
+    if (millis() - txAwaitStart > AWAIT_TIMEOUT_MS) {
+      txRound++;
+      if (txRound > MAX_TX_ROUNDS) {
+        Serial.printf(
+          "[ARQ] msg %u timed out after %d rounds; giving up\n", txMsgId, txRound);
+        failTx("LORA_INCOMPLETE");
+      } else {
+        // Nothing marked to resend, so the scheduler resends END and re-awaits.
+        Serial.printf("[ARQ] msg %u await timeout; re-prompting (round %d)\n",
+          txMsgId, txRound);
+        txPhase = TX_SENDING;
+      }
+    }
   }
+
+  // ---- Drive the radio (runs after the await check so a re-prompt goes out) ----
+  scheduleRadio();
 
   // ---- Service the TCP client (accept + non-blocking framed parse) ----
   serviceWifi();
