@@ -566,10 +566,15 @@ void setup() {
     halt("startReceive failed", state);
   }
 
-  // Bring up the WiFi Access Point and TCP server.
-  Serial.printf("Starting WiFi Access Point '%s'...\n", AP_SSID);
+  // Bring up the WiFi Access Point and TCP server. The SSID is suffixed with
+  // this board's node id (e.g. "dora-A3") so the two boards advertise distinct
+  // networks; otherwise both would broadcast "dora" and you could not attach a
+  // client to a specific board to observe the LoRa->WiFi receive path.
+  char apSsid[32];
+  snprintf(apSsid, sizeof(apSsid), "%s-%02X", AP_SSID, localAddress);
+  Serial.printf("Starting WiFi Access Point '%s'...\n", apSsid);
   WiFi.mode(WIFI_AP);
-  if (WiFi.softAP(AP_SSID, AP_PASS)) {
+  if (WiFi.softAP(apSsid, AP_PASS)) {
     Serial.print("AP IP address: ");
     Serial.println(WiFi.softAPIP());
     tcpServer.begin();
