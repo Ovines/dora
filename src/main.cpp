@@ -50,13 +50,13 @@ static const size_t   LORA_HDR = 5;
 // Data bytes per LoRa packet. 5 + 200 = 205 <= SX1262 max (255).
 static const size_t   LORA_CHUNK = 200;
 // Largest message we will bridge in either direction.
-static const size_t   MAX_BRIDGE_PAYLOAD = 2048;
+static const size_t   MAX_BRIDGE_PAYLOAD = 20480;
 // Upper bound on fragments per message (metadata + data chunks), with margin.
 static const uint16_t MAX_FRAGS = 20;
 // dst value that every node accepts.
 static const uint8_t  BROADCAST_ADDR = 0xFF;
 // Drop a half-reassembled inbound message if it stalls this long.
-static const unsigned long REASSEMBLY_TIMEOUT_MS = 20000;
+static const unsigned long REASSEMBLY_TIMEOUT_MS = 40000;
 // Cap on a single TCP header line, matching the master protocol.
 static const size_t   MAX_HEADER_LENGTH = 256;
 
@@ -538,12 +538,12 @@ void setup() {
   // begin(freq, bw, sf, cr, syncWord, power, preamble, tcxoVoltage, useLDO)
   int state = radio.begin(
     LORA_FREQUENCY,
-    62.5,   // bandwidth (kHz)
-    12,     // spreading factor
-    8,      // coding rate (4/8)
+    125,   // bandwidth (kHz)
+    9,     // spreading factor
+    7,      // coding rate (4/8)
     RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
     13,     // TX power (dBm)
-    12,     // preamble length
+    8,     // preamble length
     LORA_TCXO_VOLTAGE,
     false   // use DC-DC + TCXO, not LDO
   );
