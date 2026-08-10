@@ -134,6 +134,18 @@ size_t   rxSize = 0;
 unsigned long rxLastMillis = 0;
 uint32_t bridgedRx = 0;
 
+// ---- Saved last inbound message (survives WiFi client disconnects) ----------
+// A single-slot RAM copy of the most recently completed inbound message. It is
+// held separately from rxAssembly (which the ARQ receiver reuses for the next
+// message) so a client that was absent, or that dropped mid-transfer, still
+// gets the message once it (re)connects. In-RAM only: lost on reboot.
+uint8_t  savedPayload[MAX_BRIDGE_PAYLOAD];
+bool     savedValid = false;     // a message has been stored
+bool     savedPending = false;   // stored message still needs a full delivery
+String   savedType;
+String   savedFilename;
+size_t   savedSize = 0;
+
 // Remember the most recently completed inbound message so a late END (whose DONE
 // was lost) can be re-acknowledged without re-delivering to the client.
 bool     lastCompletedValid = false;
@@ -386,24 +398,52 @@ void resetRx() {
   }
 }
 
-void deliverToClient() {
-  if (currentClient && currentClient.connected()) {
-    String hdr = "RECV:" + rxType + ":" + rxFilename + ":" + String((unsigned int)rxSize) + "\n";
-    currentClient.print(hdr);
-    if (rxSize > 0) {
-      currentClient.write(rxAssembly, rxSize);
-    }
-    currentClient.flush();
+// Copy the freshly reassembled message into the saved slot and mark it as
+// needing delivery. A newer message overwrites the previous slot.
+void saveInbound() {
+  savedType = rxType;
+  savedFilename = rxFilename;
+  savedSize = rxSize;
+  if (rxSize > 0) {
+    memcpy(savedPayload, rxAssembly, rxSize);
+  }
+  savedValid = true;
+  savedPending = true;
+  Serial.printf(
+    "[BRIDGE] stored inbound %s '%s' %u bytes (awaiting client)\n",
+    savedType.c_str(),
+    savedFilename.c_str(),
+    (unsigned int)savedSize
+  );
+}
+
+// Deliver the saved message to the connected client, if one is pending. Clears
+// the pending flag only on a fully successful write, so a mid-transfer
+// disconnect leaves it pending to retry when the client reconnects.
+void tryDeliverSaved() {
+  if (!savedPending || !currentClient || !currentClient.connected()) {
+    return;
+  }
+
+  String hdr = "RECV:" + savedType + ":" + savedFilename + ":" + String((unsigned int)savedSize) + "\n";
+  size_t hw = currentClient.print(hdr);
+  size_t pw = (savedSize > 0) ? currentClient.write(savedPayload, savedSize) : 0;
+  currentClient.flush();
+
+  bool ok = (hw == hdr.length()) && (pw == savedSize) && currentClient.connected();
+  if (ok) {
+    savedPending = false;
     Serial.printf(
       "[BRIDGE] LoRa->WiFi delivered %s '%s' %u bytes to client\n",
-      rxType.c_str(),
-      rxFilename.c_str(),
-      (unsigned int)rxSize
+      savedType.c_str(),
+      savedFilename.c_str(),
+      (unsigned int)savedSize
     );
   } else {
     Serial.printf(
-      "[BRIDGE] LoRa msg complete (%u bytes) but no WiFi client connected; dropped\n",
-      (unsigned int)rxSize
+      "[BRIDGE] delivery interrupted (%u/%u payload bytes); will retry on reconnect\n",
+      (unsigned int)pw,
+      (unsigned int)savedSize
     );
   }
 }
@@ -478,7 +518,8 @@ void feedReassembler(
 
   if (rxMetaGot && rxReceivedCount == rxFragCount) {
     bridgedRx++;
-    deliverToClient();
+    saveInbound();
+    tryDeliverSaved();
     // Remember this message and queue a DONE ack back to the sender. The sender
     // keeps re-sending END until it hears DONE, so a lost DONE is re-requested.
     lastCompletedValid = true;
@@ -770,6 +811,10 @@ void serviceWifi() {
       Serial.println("[BRIDGE] TCP client connected.");
     }
   }
+
+  // Flush any message that arrived while no client was connected (or that was
+  // interrupted by a mid-transfer disconnect). No-op when nothing is pending.
+  tryDeliverSaved();
 
   // Process a bounded number of bytes per pass so the radio still gets serviced.
   int guard = 0;
