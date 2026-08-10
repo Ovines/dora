@@ -61,6 +61,10 @@ static const uint8_t  BROADCAST_ADDR = 0xFF;
 // Cap on a single TCP header line, matching the master protocol.
 static const size_t   MAX_HEADER_LENGTH = 256;
 
+// Uncomment to simulate a single random dropped LoRa data fragment per outbound
+// message and exercise the NACK-based ARQ recovery path.
+#define SIMULATE_RANDOM_DROP
+
 // ---- Reliability (NACK-based ARQ) ------------------------------------------
 // Packet kinds carried in the header 'kind' byte.
 enum LoraKind {
@@ -109,6 +113,10 @@ uint16_t txFragCount = 0;                  // metadata frag + data frags
 bool     txToSend[MAX_FRAGS];              // fragments still to send this pass
 int      txRound = 0;                      // resend pass counter (1-based)
 unsigned long txAwaitStart = 0;            // when we began waiting after END
+#ifdef SIMULATE_RANDOM_DROP
+uint16_t txDropFragIndex = 0;              // simulate one dropped fragment per send
+bool     txDropInjected = false;
+#endif
 uint32_t bridgedTx = 0;
 
 // ---- Inbound (LoRa -> WiFi client) reassembly state ------------------------
@@ -238,6 +246,14 @@ void sendData(uint16_t index) {
     len += chunk;
   }
 
+#ifdef SIMULATE_RANDOM_DROP
+  if (!txDropInjected && index == txDropFragIndex) {
+    txDropInjected = true;
+    Serial.printf("[TX] simulated drop of msg %u frag %u/%u\n", txMsgId, (unsigned int)index, (unsigned int)(txFragCount - 1));
+    return;
+  }
+#endif
+
   int state = radio.startTransmit(buf, len);
   if (state == RADIOLIB_ERR_NONE) {
     transmitting = true;
@@ -298,6 +314,10 @@ void startBridgeTx(const String& type, const String& filename, size_t size) {
   for (uint16_t i = 0; i < MAX_FRAGS; i++) {
     txToSend[i] = (i < txFragCount);
   }
+#ifdef SIMULATE_RANDOM_DROP
+  txDropInjected = false;
+  txDropFragIndex = (uint16_t)random(0, txFragCount);
+#endif
   txPhase = TX_SENDING;
   txRound = 1;
   txActive = true;
@@ -774,6 +794,7 @@ void setup() {
     localAddress = 0x01;
   }
   Serial.printf("This node id: 0x%02X\n", localAddress);
+  randomSeed((uint32_t)micros());
 
   resetRx();
   resetWifiParser();
