@@ -87,6 +87,10 @@ SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
 WiFiServer tcpServer(TCP_PORT);
 WiFiClient currentClient;   // single active TCP client
+// True only after the client's HELLO handshake has been answered. We must not
+// push any RECV frame before this, or it would land where the app expects the
+// "ESP32_DORA_OK" handshake reply and break its connection.
+bool clientReady = false;
 
 uint8_t localAddress = 0x00;   // this board's id (set from MAC in setup)
 
@@ -430,7 +434,7 @@ void saveInbound() {
 // writes without the client ever receiving them. Resends after a timeout so a
 // lost frame (or a stale socket that later fills up) is retried.
 void tryDeliverSaved() {
-  if (!savedPending || !currentClient || !currentClient.connected()) {
+  if (!savedPending || !currentClient || !currentClient.connected() || !clientReady) {
     return;
   }
   // Already sent and still within the ACK window: keep waiting.
@@ -737,6 +741,8 @@ void processWifiByte(uint8_t c) {
           if (currentClient && currentClient.connected()) {
             currentClient.println("ESP32_DORA_OK");
           }
+          // Only now may we push RECV frames to this client.
+          clientReady = true;
           Serial.println("[BRIDGE] handshake answered.");
           return;
         }
@@ -845,7 +851,9 @@ void serviceWifi() {
       currentClient = incoming;
       currentClient.setNoDelay(true);
       resetWifiParser();
-      // Re-arm delivery so any pending message is resent to this new client.
+      // Wait for the HELLO handshake before pushing anything, and re-arm delivery
+      // so any pending message is (re)sent to this new client once it is ready.
+      clientReady = false;
       savedAwaitingAck = false;
       Serial.println("[BRIDGE] TCP client connected.");
     }
