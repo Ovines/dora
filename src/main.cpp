@@ -142,9 +142,16 @@ uint32_t bridgedRx = 0;
 uint8_t  savedPayload[MAX_BRIDGE_PAYLOAD];
 bool     savedValid = false;     // a message has been stored
 bool     savedPending = false;   // stored message still needs a full delivery
+bool     savedAwaitingAck = false; // frame was written; waiting for client ACK
+unsigned long savedSentMillis = 0; // when the frame was last written to a client
 String   savedType;
 String   savedFilename;
 size_t   savedSize = 0;
+// A local TCP write only proves the bytes were buffered, not that the client
+// received them (a client whose WiFi dropped leaves a half-open socket that
+// still reports connected()). So delivery is confirmed by an application-level
+// "ACK" line from the app; until then the message stays pending and is resent.
+static const unsigned long DELIVERY_ACK_TIMEOUT_MS = 8000;
 
 // Remember the most recently completed inbound message so a late END (whose DONE
 // was lost) can be re-acknowledged without re-delivering to the client.
@@ -417,11 +424,17 @@ void saveInbound() {
   );
 }
 
-// Deliver the saved message to the connected client, if one is pending. Clears
-// the pending flag only on a fully successful write, so a mid-transfer
-// disconnect leaves it pending to retry when the client reconnects.
+// Write the saved message to the connected client and wait for its ACK. The
+// pending flag is cleared only when the client ACKs (see processWifiByte), NOT
+// on a successful local write, because a half-open socket accepts buffered
+// writes without the client ever receiving them. Resends after a timeout so a
+// lost frame (or a stale socket that later fills up) is retried.
 void tryDeliverSaved() {
   if (!savedPending || !currentClient || !currentClient.connected()) {
+    return;
+  }
+  // Already sent and still within the ACK window: keep waiting.
+  if (savedAwaitingAck && (millis() - savedSentMillis < DELIVERY_ACK_TIMEOUT_MS)) {
     return;
   }
 
@@ -430,21 +443,25 @@ void tryDeliverSaved() {
   size_t pw = (savedSize > 0) ? currentClient.write(savedPayload, savedSize) : 0;
   currentClient.flush();
 
-  bool ok = (hw == hdr.length()) && (pw == savedSize) && currentClient.connected();
-  if (ok) {
-    savedPending = false;
+  if ((hw == hdr.length()) && (pw == savedSize) && currentClient.connected()) {
+    savedAwaitingAck = true;
+    savedSentMillis = millis();
     Serial.printf(
-      "[BRIDGE] LoRa->WiFi delivered %s '%s' %u bytes to client\n",
+      "[BRIDGE] sent %s '%s' %u bytes; awaiting client ACK\n",
       savedType.c_str(),
       savedFilename.c_str(),
       (unsigned int)savedSize
     );
   } else {
+    // The write failed part-way: the socket is dead (likely half-open). Drop it
+    // so a genuinely new client can be accepted; the message stays pending.
+    savedAwaitingAck = false;
     Serial.printf(
-      "[BRIDGE] delivery interrupted (%u/%u payload bytes); will retry on reconnect\n",
+      "[BRIDGE] delivery write failed (%u/%u bytes); dropping stale client\n",
       (unsigned int)pw,
       (unsigned int)savedSize
     );
+    currentClient.stop();
   }
 }
 
@@ -724,6 +741,20 @@ void processWifiByte(uint8_t c) {
           return;
         }
 
+        if (line == "ACK") {
+          // Client confirmed it received the saved message: delivery is done.
+          if (savedPending && savedAwaitingAck) {
+            savedPending = false;
+            savedAwaitingAck = false;
+            Serial.printf(
+              "[BRIDGE] client ACKed %s '%s'; delivery confirmed\n",
+              savedType.c_str(),
+              savedFilename.c_str()
+            );
+          }
+          return;
+        }
+
         String t;
         String f;
         size_t s = 0;
@@ -802,12 +833,20 @@ void processWifiByte(uint8_t c) {
 }
 
 void serviceWifi() {
-  if (!currentClient || !currentClient.connected()) {
+  // A newly arriving client always takes over. This also recovers from a
+  // half-open socket (client's WiFi dropped without a FIN, so connected() still
+  // reads true): the phone's reconnect brings a fresh socket we switch to here.
+  if (tcpServer.hasClient()) {
     WiFiClient incoming = tcpServer.available();
     if (incoming) {
+      if (currentClient) {
+        currentClient.stop();
+      }
       currentClient = incoming;
       currentClient.setNoDelay(true);
       resetWifiParser();
+      // Re-arm delivery so any pending message is resent to this new client.
+      savedAwaitingAck = false;
       Serial.println("[BRIDGE] TCP client connected.");
     }
   }
