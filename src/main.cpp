@@ -140,6 +140,11 @@ uint32_t bridgedRx = 0;
 // Last reception percentage pushed to the client, so PROG frames are only sent
 // when the integer percentage actually changes. Reset per message in resetRx().
 int      lastProgressPct = -1;
+// RSSI/SNR of the most recently received DATA fragment. Sent as raw per-packet
+// samples in the PROG frame; the app keeps the moving averages so the ESP stays
+// simple. Captured in handleReceivedPacket() before feedReassembler runs.
+float    lastRssi = 0.0f;
+float    lastSnr = 0.0f;
 
 // ---- Saved last inbound message (survives WiFi client disconnects) ----------
 // A single-slot RAM copy of the most recently completed inbound message. It is
@@ -492,8 +497,11 @@ void sendProgress() {
   }
   lastProgressPct = pct;
   String name = rxMetaGot ? rxFilename : String("");
+  // PROG:name:received:total:rssi:snr - rssi/snr are the raw samples from the
+  // latest fragment; the app maintains the moving averages.
   currentClient.print(
-    "PROG:" + name + ":" + String(rxReceivedCount) + ":" + String(rxFragCount) + "\n");
+    "PROG:" + name + ":" + String(rxReceivedCount) + ":" + String(rxFragCount) +
+    ":" + String(lastRssi, 1) + ":" + String(lastSnr, 1) + "\n");
 }
 
 // Add one received LoRa fragment to the reassembly slot; deliver when complete.
@@ -715,10 +723,12 @@ void handleReceivedPacket() {
 
   switch (kind) {
     case KIND_DATA:
+      lastRssi = radio.getRSSI();
+      lastSnr = radio.getSNR();
       Serial.printf(
         "[RX] DATA from 0x%02X msg %u frag %u/%u (RSSI %.1f dBm, SNR %.1f dB)\n",
         src, msgId, fragIndex, fragCount ? (fragCount - 1) : 0,
-        radio.getRSSI(), radio.getSNR());
+        lastRssi, lastSnr);
       feedReassembler(src, msgId, fragIndex, fragCount, payload, payloadLen);
       break;
     case KIND_END:
