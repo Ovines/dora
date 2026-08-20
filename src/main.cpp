@@ -109,8 +109,8 @@ RadioTx currentTx = RTX_NONE;
 // Each board periodically broadcasts whether it currently has a ready WiFi
 // client. The peer forwards this to its own app so the user can see if a client
 // is connected on the far side of the LoRa link.
-static const unsigned long STATUS_TX_INTERVAL_MS = 5000;    // announce our state this often when idle
-static const unsigned long PEER_STATUS_TIMEOUT_MS = 16000;  // no heartbeat this long => treat peer client as gone
+static const unsigned long STATUS_TX_INTERVAL_MS = 60000;    // announce our state this often when idle
+static const unsigned long PEER_STATUS_TIMEOUT_MS = 195000;  // ~3 missed heartbeats => treat peer client as gone
 unsigned long lastStatusTxMillis = 0;     // when we last broadcast our status
 unsigned long lastPeerStatusMillis = 0;   // when we last heard the peer's status
 bool statusDirty = true;                  // our client state changed: announce ASAP
