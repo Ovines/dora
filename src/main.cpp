@@ -137,6 +137,9 @@ String   rxFilename;
 size_t   rxSize = 0;
 unsigned long rxLastMillis = 0;
 uint32_t bridgedRx = 0;
+// Last reception percentage pushed to the client, so PROG frames are only sent
+// when the integer percentage actually changes. Reset per message in resetRx().
+int      lastProgressPct = -1;
 
 // ---- Saved last inbound message (survives WiFi client disconnects) ----------
 // A single-slot RAM copy of the most recently completed inbound message. It is
@@ -404,6 +407,7 @@ void resetRx() {
   rxReceivedCount = 0;
   rxFragCount = 0;
   rxSize = 0;
+  lastProgressPct = -1;
   for (uint16_t i = 0; i < MAX_FRAGS; i++) {
     rxFragGot[i] = false;
   }
@@ -467,6 +471,29 @@ void tryDeliverSaved() {
     );
     currentClient.stop();
   }
+}
+
+// Push a live reception-progress line to the connected client. Best-effort and
+// header-only (no payload, no ACK): throttled to whole-percent changes so it is
+// cheap even for large messages. Completion is signalled separately by RECV.
+void sendProgress() {
+  if (!currentClient || !currentClient.connected() || !clientReady) {
+    return;
+  }
+  if (rxFragCount <= 2) {
+    return;  // tiny messages (e.g. short text) are not worth a progress bar
+  }
+  int pct = (int)((uint32_t)rxReceivedCount * 100 / rxFragCount);
+  if (pct >= 100) {
+    return;  // the RECV frame is the "done" signal
+  }
+  if (pct == lastProgressPct) {
+    return;  // only emit when the integer percentage changes
+  }
+  lastProgressPct = pct;
+  String name = rxMetaGot ? rxFilename : String("");
+  currentClient.print(
+    "PROG:" + name + ":" + String(rxReceivedCount) + ":" + String(rxFragCount) + "\n");
 }
 
 // Add one received LoRa fragment to the reassembly slot; deliver when complete.
@@ -536,6 +563,9 @@ void feedReassembler(
     rxFragGot[fragIndex] = true;
     rxReceivedCount++;
   }
+
+  // Live progress update to the client while the message is still assembling.
+  sendProgress();
 
   if (rxMetaGot && rxReceivedCount == rxFragCount) {
     bridgedRx++;
