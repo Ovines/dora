@@ -116,6 +116,10 @@ unsigned long lastPeerStatusMillis = 0;   // when we last heard the peer's statu
 bool statusDirty = true;                  // our client state changed: announce ASAP
 bool peerHasClient = false;               // does the peer board have a ready client?
 int  lastPeerSentState = -1;              // last PEER value pushed to our app (-1 = none yet)
+// Local transfer activity mirrored to our own app so the "remote" pill can read
+// TRANSMITTING/RECEIVING instead of falling back to idle while a transfer runs
+// (heartbeats pause during a transfer). -1 forces a resend (e.g. new client).
+int  lastXferSent = -1;                   // 0 = idle, 1 = transmitting, 2 = receiving
 
 // ---- Outbound (WiFi client -> LoRa) message state --------------------------
 enum TxPhase { TX_IDLE, TX_SENDING, TX_AWAIT };
@@ -375,6 +379,22 @@ void notifyPeerStatus() {
   }
   lastPeerSentState = state;
   currentClient.print(String("PEER:") + state + "\n");
+}
+
+// Mirror this board's transfer activity to its own app (edge-triggered). While a
+// message is in flight the boards stop heartbeating, so without this the remote
+// pill would time out to idle; instead the app shows TRANSMITTING/RECEIVING.
+void sendXferStatus() {
+  if (!currentClient || !currentClient.connected() || !clientReady) {
+    return;
+  }
+  int cur = txActive ? 1 : (rxActive ? 2 : 0);
+  if (cur == lastXferSent) {
+    return;
+  }
+  lastXferSent = cur;
+  const char* s = (cur == 1) ? "TX" : (cur == 2) ? "RX" : "IDLE";
+  currentClient.print(String("XFER:") + s + "\n");
 }
 
 // Index of the lowest fragment still needing transmission this pass, or -1.
@@ -855,7 +875,9 @@ void processWifiByte(uint8_t c) {
           // the current known peer state to this newly-ready client.
           statusDirty = true;
           lastPeerSentState = -1;
+          lastXferSent = -1;
           notifyPeerStatus();
+          sendXferStatus();
           Serial.println("[BRIDGE] handshake answered.");
           return;
         }
@@ -969,6 +991,7 @@ void serviceWifi() {
       clientReady = false;
       savedAwaitingAck = false;
       statusDirty = true;   // availability changing; re-announce to the peer
+      lastXferSent = -1;    // re-push transfer activity to the new client
       Serial.println("[BRIDGE] TCP client connected.");
     }
   }
@@ -1161,6 +1184,9 @@ void loop() {
 
   // ---- Service the TCP client (accept + non-blocking framed parse) ----
   serviceWifi();
+
+  // ---- Reflect our transfer activity to the app (edge-triggered) ----
+  sendXferStatus();
 
   // ---- Drop a stalled inbound reassembly so its buffer can be reused ----
   if (rxActive && (millis() - rxLastMillis > REASSEMBLY_TIMEOUT_MS)) {
