@@ -71,7 +71,8 @@ enum LoraKind {
   KIND_DATA = 0,   // fragIndex/fragCount valid; payload = metadata (frag 0) or chunk
   KIND_END  = 1,   // sender -> receiver: all fragments for this pass were sent
   KIND_NACK = 2,   // receiver -> sender: payload = missing fragment indices (1 byte each)
-  KIND_DONE = 3    // receiver -> sender: full message received
+  KIND_DONE = 3,   // receiver -> sender: full message received
+  KIND_STATUS = 4  // periodic broadcast: payload[0] = 1 if this node has a ready WiFi client
 };
 // After sending END, how long the sender waits for a NACK/DONE before it
 // re-prompts by resending END.
@@ -101,8 +102,20 @@ bool transmitting = false;
 
 // What the current in-flight transmit is, so the completion IRQ knows what to do
 // next (keep sending data, wait for a reply, or just resume listening).
-enum RadioTx { RTX_NONE, RTX_DATA, RTX_END, RTX_NACK, RTX_DONE };
+enum RadioTx { RTX_NONE, RTX_DATA, RTX_END, RTX_NACK, RTX_DONE, RTX_STATUS };
 RadioTx currentTx = RTX_NONE;
+
+// ---- Peer status heartbeat -------------------------------------------------
+// Each board periodically broadcasts whether it currently has a ready WiFi
+// client. The peer forwards this to its own app so the user can see if a client
+// is connected on the far side of the LoRa link.
+static const unsigned long STATUS_TX_INTERVAL_MS = 5000;    // announce our state this often when idle
+static const unsigned long PEER_STATUS_TIMEOUT_MS = 16000;  // no heartbeat this long => treat peer client as gone
+unsigned long lastStatusTxMillis = 0;     // when we last broadcast our status
+unsigned long lastPeerStatusMillis = 0;   // when we last heard the peer's status
+bool statusDirty = true;                  // our client state changed: announce ASAP
+bool peerHasClient = false;               // does the peer board have a ready client?
+int  lastPeerSentState = -1;              // last PEER value pushed to our app (-1 = none yet)
 
 // ---- Outbound (WiFi client -> LoRa) message state --------------------------
 enum TxPhase { TX_IDLE, TX_SENDING, TX_AWAIT };
@@ -321,6 +334,45 @@ void sendEnd() {
     Serial.printf("[TX] startTransmit(END) failed, code %d\n", state);
     failTx("TX_FAILED");
   }
+}
+
+// Broadcast this node's WiFi-client availability so the peer board can show
+// whether a remote client is connected. Only called from the idle path so it
+// never disturbs an in-flight transfer or ARQ exchange.
+void sendStatus() {
+  uint8_t buf[LORA_HDR + 1];
+  buf[0] = BROADCAST_ADDR;
+  buf[1] = localAddress;
+  buf[2] = KIND_STATUS;
+  buf[3] = 0;
+  buf[4] = 0;
+  buf[5] = 0;
+  buf[LORA_HDR] = clientReady ? 1 : 0;
+
+  int state = radio.startTransmit(buf, LORA_HDR + 1);
+  if (state == RADIOLIB_ERR_NONE) {
+    transmitting = true;
+    currentTx = RTX_STATUS;
+    lastStatusTxMillis = millis();
+    statusDirty = false;
+  } else {
+    Serial.printf("[TX] startTransmit(STATUS) failed, code %d\n", state);
+    radio.startReceive();
+  }
+}
+
+// Push the peer's client availability to our own app, but only when it changes
+// (or when a client freshly connects). Header-only line, no ACK.
+void notifyPeerStatus() {
+  if (!currentClient || !currentClient.connected() || !clientReady) {
+    return;
+  }
+  int state = peerHasClient ? 1 : 0;
+  if (state == lastPeerSentState) {
+    return;
+  }
+  lastPeerSentState = state;
+  currentClient.print(String("PEER:") + state + "\n");
 }
 
 // Index of the lowest fragment still needing transmission this pass, or -1.
@@ -745,6 +797,13 @@ void handleReceivedPacket() {
       Serial.printf("[RX] DONE from 0x%02X msg %u\n", src, msgId);
       onDone(msgId);
       break;
+    case KIND_STATUS:
+      peerHasClient = (payloadLen >= 1 && payload[0] != 0);
+      lastPeerStatusMillis = millis();
+      Serial.printf("[RX] STATUS from 0x%02X: peer client %s\n",
+        src, peerHasClient ? "connected" : "disconnected");
+      notifyPeerStatus();
+      break;
     default:
       Serial.printf("[RX] unknown kind %u from 0x%02X; ignored\n", kind, src);
       break;
@@ -783,6 +842,11 @@ void processWifiByte(uint8_t c) {
           }
           // Only now may we push RECV frames to this client.
           clientReady = true;
+          // Our availability just changed, so announce it to the peer, and push
+          // the current known peer state to this newly-ready client.
+          statusDirty = true;
+          lastPeerSentState = -1;
+          notifyPeerStatus();
           Serial.println("[BRIDGE] handshake answered.");
           return;
         }
@@ -895,8 +959,17 @@ void serviceWifi() {
       // so any pending message is (re)sent to this new client once it is ready.
       clientReady = false;
       savedAwaitingAck = false;
+      statusDirty = true;   // availability changing; re-announce to the peer
       Serial.println("[BRIDGE] TCP client connected.");
     }
+  }
+
+  // Detect a clean client disconnect so we stop advertising ourselves as
+  // available to the peer (half-open sockets are still handled on reconnect).
+  if (clientReady && (!currentClient || !currentClient.connected())) {
+    clientReady = false;
+    statusDirty = true;
+    Serial.println("[BRIDGE] TCP client disconnected.");
   }
 
   // Flush any message that arrived while no client was connected (or that was
@@ -1029,6 +1102,16 @@ void scheduleRadio() {
 
   if (!txActive && pendingRespond) {
     sendPendingControl();
+    return;
+  }
+
+  // Fully idle: announce our client availability to the peer. Send immediately
+  // when our own state just changed, otherwise on the periodic interval. Skip
+  // while a message is reassembling so we don't step on the incoming stream.
+  if (!txActive && !rxActive) {
+    if (statusDirty || (millis() - lastStatusTxMillis >= STATUS_TX_INTERVAL_MS)) {
+      sendStatus();
+    }
   }
 }
 
@@ -1074,5 +1157,12 @@ void loop() {
   if (rxActive && (millis() - rxLastMillis > REASSEMBLY_TIMEOUT_MS)) {
     Serial.println("[BRIDGE] reassembly timeout; dropping partial message.");
     resetRx();
+  }
+
+  // ---- Peer heartbeat timeout: stop reporting a stale "remote connected" ----
+  if (peerHasClient && (millis() - lastPeerStatusMillis > PEER_STATUS_TIMEOUT_MS)) {
+    peerHasClient = false;
+    Serial.println("[BRIDGE] peer heartbeat lost; marking remote client gone.");
+    notifyPeerStatus();
   }
 }
