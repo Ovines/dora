@@ -63,7 +63,7 @@ static const size_t   MAX_HEADER_LENGTH = 256;
 
 // Uncomment to simulate a single random dropped LoRa data fragment per outbound
 // message and exercise the NACK-based ARQ recovery path.
-#define SIMULATE_RANDOM_DROP
+// #define SIMULATE_RANDOM_DROP
 
 // ---- Reliability (NACK-based ARQ) ------------------------------------------
 // Packet kinds carried in the header 'kind' byte.
@@ -149,6 +149,7 @@ String   rxType;
 String   rxFilename;
 size_t   rxSize = 0;
 unsigned long rxLastMillis = 0;
+unsigned long rxFirstMillis = 0;   // arrival time of this message's first fragment
 uint32_t bridgedRx = 0;
 // Last reception percentage pushed to the client, so PROG frames are only sent
 // when the integer percentage actually changes. Reset per message in resetRx().
@@ -172,6 +173,7 @@ unsigned long savedSentMillis = 0; // when the frame was last written to a clien
 String   savedType;
 String   savedFilename;
 size_t   savedSize = 0;
+unsigned long savedDurationMs = 0; // first->last fragment transfer time for this message
 // A local TCP write only proves the bytes were buffered, not that the client
 // received them (a client whose WiFi dropped leaves a half-open socket that
 // still reports connected()). So delivery is confirmed by an application-level
@@ -476,16 +478,19 @@ void saveInbound() {
   savedType = rxType;
   savedFilename = rxFilename;
   savedSize = rxSize;
+  // Transfer time from the first fragment to the last (this completing one).
+  savedDurationMs = (rxFirstMillis != 0) ? (rxLastMillis - rxFirstMillis) : 0;
   if (rxSize > 0) {
     memcpy(savedPayload, rxAssembly, rxSize);
   }
   savedValid = true;
   savedPending = true;
   Serial.printf(
-    "[BRIDGE] stored inbound %s '%s' %u bytes (awaiting client)\n",
+    "[BRIDGE] stored inbound %s '%s' %u bytes in %lu ms (awaiting client)\n",
     savedType.c_str(),
     savedFilename.c_str(),
-    (unsigned int)savedSize
+    (unsigned int)savedSize,
+    savedDurationMs
   );
 }
 
@@ -503,7 +508,10 @@ void tryDeliverSaved() {
     return;
   }
 
-  String hdr = "RECV:" + savedType + ":" + savedFilename + ":" + String((unsigned int)savedSize) + "\n";
+  // RECV:type:name:size:durationMs - durationMs is the receiver-side transfer
+  // time (first fragment to last) so the app can show how long it took to arrive.
+  String hdr = "RECV:" + savedType + ":" + savedFilename + ":" +
+               String((unsigned int)savedSize) + ":" + String(savedDurationMs) + "\n";
   size_t hw = currentClient.print(hdr);
   size_t pw = (savedSize > 0) ? currentClient.write(savedPayload, savedSize) : 0;
   currentClient.flush();
@@ -584,6 +592,7 @@ void feedReassembler(
     rxSrc = src;
     rxMsgId = msgId;
     rxFragCount = fragCount;
+    rxFirstMillis = millis();   // start the transfer clock on the first fragment
   }
   rxLastMillis = millis();
 
